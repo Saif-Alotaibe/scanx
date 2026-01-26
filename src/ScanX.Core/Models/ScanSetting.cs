@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Text;
 
@@ -6,26 +6,6 @@ namespace ScanX.Core.Models
 {
     public class ScanSetting
     {
-        public const int WIA_PAGE_SIZE = 3097;
-
-        public const int WIA_COLOR_MODE = 6146;
-
-        public const int WIA_HORIZONTAL_EXTENT = 6151;
-        
-        public const int WIA_VERTICAL_EXTENT = 6152;
-
-        public const int WIA_VERTICAL_RESOLUTION = 6148;
-
-        public const int WIA_HORIZONTAL_RESOLUTION = 6147;
-
-        public const int WIA_PAGE_WIDTH = 3098;
-
-        public const int WIA_PAGE_HEIGHT = 3099;
-
-        public const int WIA_THRESHOLD = 6159;
-
-        public const int WIA_ITEM_SIZE = 4116;
-        
         public enum DPI
         {
             DPI_72 = 72,
@@ -56,7 +36,7 @@ namespace ScanX.Core.Models
         //for more info https://www.papersizes.org/a-sizes-in-pixels.htm
         public static (int width,int height) GetA4SizeByDpi(int dpiValue)
         {
-            
+
             var dpi = (DPI)dpiValue;
 
             switch (dpi)

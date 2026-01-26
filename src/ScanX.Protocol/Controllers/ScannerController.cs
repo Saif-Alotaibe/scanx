@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
@@ -12,8 +12,8 @@ namespace ScanX.Protocol.Controllers
     public class ScannerController : ApiBaseController
     {
         private readonly ILogger<ScannerController> _logger;
-        private static TwainDeviceClient _twainClient;
-        private static readonly object _twainLock = new object();
+        private static DeviceClient _client;
+        private static readonly object _clientLock = new object();
 
         public ScannerController(ILogger<ScannerController> logger)
         {
@@ -21,92 +21,32 @@ namespace ScanX.Protocol.Controllers
         }
 
         /// <summary>
-        /// Get all WIA scanners.
+        /// Get all available TWAIN scanners.
         /// </summary>
         [HttpGet]
         public IActionResult Get()
         {
-            List<ScannerDevice> result = new List<ScannerDevice>();
-
-            using (DeviceClient client = new DeviceClient())
-            {
-                result = client.GetAllScanners();
-            }
-            return Ok(result);
-        }
-
-        /// <summary>
-        /// Get all TWAIN scanners. Use this for document scanners like Fujitsu fi-8170.
-        /// </summary>
-        [HttpGet("twain")]
-        public IActionResult GetTwainScanners()
-        {
             try
             {
-                EnsureTwainInitialized();
-                var result = _twainClient.GetAllScanners();
+                EnsureClientInitialized();
+                var result = _client.GetAllScanners();
                 return Ok(result);
             }
             catch (Exception ex)
             {
-                _logger?.LogError($"Error getting TWAIN scanners: {ex}");
+                _logger?.LogError($"Error getting scanners: {ex}");
                 return StatusCode(500, new { error = ex.Message });
             }
         }
 
-        /// <summary>
-        /// Get all scanners from both WIA and TWAIN.
-        /// </summary>
-        [HttpGet("all")]
-        public IActionResult GetAllScanners()
+        private void EnsureClientInitialized()
         {
-            var result = new List<ScannerDevice>();
-
-            // Get WIA scanners
-            try
+            lock (_clientLock)
             {
-                using (DeviceClient client = new DeviceClient())
+                if (_client == null)
                 {
-                    var wiaScanners = client.GetAllScanners();
-                    foreach (var scanner in wiaScanners)
-                    {
-                        scanner.Description = $"[WIA] {scanner.Description}";
-                        result.Add(scanner);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger?.LogWarning($"Error getting WIA scanners: {ex.Message}");
-            }
-
-            // Get TWAIN scanners
-            try
-            {
-                EnsureTwainInitialized();
-                var twainScanners = _twainClient.GetAllScanners();
-                foreach (var scanner in twainScanners)
-                {
-                    scanner.Description = $"[TWAIN] {scanner.Description}";
-                    result.Add(scanner);
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger?.LogWarning($"Error getting TWAIN scanners: {ex.Message}");
-            }
-
-            return Ok(result);
-        }
-
-        private void EnsureTwainInitialized()
-        {
-            lock (_twainLock)
-            {
-                if (_twainClient == null)
-                {
-                    _twainClient = new TwainDeviceClient(_logger);
-                    _twainClient.Initialize();
+                    _client = new DeviceClient(_logger);
+                    _client.Initialize();
                 }
             }
         }

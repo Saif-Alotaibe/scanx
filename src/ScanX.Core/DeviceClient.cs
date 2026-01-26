@@ -1,41 +1,42 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
-using System.Drawing.Printing;
-using System.Text;
-using System.Linq;
-using System.Management;
-using WIA;
-using ScanX.Core.Models;
-using System.Runtime.InteropServices;
-using ScanX.Core.Args;
 using System.Drawing;
-using System.Diagnostics;
-using System.IO;
 using System.Drawing.Imaging;
-using ScanX.Core.Exceptions;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Threading;
 using Microsoft.Extensions.Logging;
+using NTwain;
+using NTwain.Data;
+using ScanX.Core.Args;
+using ScanX.Core.Exceptions;
+using ScanX.Core.Models;
 
 namespace ScanX.Core
 {
-    //for more info https://ourcodeworld.com/articles/read/382/creating-a-scanning-application-in-winforms-with-csharp
+    /// <summary>
+    /// TWAIN-based scanner client for reliable ADF scanning.
+    /// Supports document scanners like Fujitsu fi-8170.
+    /// </summary>
     public class DeviceClient : IDisposable
     {
-        public const uint WIA_ERROR_PAPER_EMPTY = 0x80210003;
-        public const uint WIA_ERROR_COVER_OPEN = 0x80210016;
-        public const uint WIA_ERROR_DEVICE_COMMUNICATION = 0x8021000A;
-        public const uint WIA_ERROR_DEVICE_LOCKED = 0x8021000D;
-
-        public object WIA_IPS_BRIGHTNESS { get; private set; }
+        private readonly ILogger _logger;
+        private TwainSession _session;
+        private DataSource _currentSource;
+        private readonly List<byte[]> _scannedImages;
+        private readonly ManualResetEventSlim _scanCompleteEvent;
+        private ScanSetting _currentSettings;
+        private int _pageCount;
+        private Exception _scanException;
+        private bool _disposed;
 
         public event EventHandler OnImageScanned;
 
-        private readonly ILogger _logger;
-
-        private readonly DeviceManager _deviceManager;
-
         public DeviceClient()
         {
-            _deviceManager = new DeviceManager();
+            _scannedImages = new List<byte[]>();
+            _scanCompleteEvent = new ManualResetEventSlim(false);
         }
 
         public DeviceClient(ILogger logger) : this()
@@ -43,403 +44,400 @@ namespace ScanX.Core
             _logger = logger;
         }
 
-        public List<string> GetAllPrinters()
+        /// <summary>
+        /// Initialize TWAIN session. Must be called from a UI thread with message pump.
+        /// </summary>
+        public void Initialize(IntPtr windowHandle)
         {
-            List<string> result = new List<string>();
+            var appId = TWIdentity.CreateFromAssembly(DataGroups.Image, Assembly.GetExecutingAssembly());
+            _session = new TwainSession(appId);
+            _session.Open(new MessageLoopHook(windowHandle));
 
-            var printers = PrinterSettings.InstalledPrinters;
+            // Subscribe to TWAIN events
+            _session.TransferReady += Session_TransferReady;
+            _session.DataTransferred += Session_DataTransferred;
+            _session.TransferError += Session_TransferError;
+            _session.SourceDisabled += Session_SourceDisabled;
 
-            foreach (string item in printers)
-            {
-                result.Add(item);
-            }
-
-            return result;
-
+            _logger?.LogInformation("TWAIN session initialized");
         }
 
+        /// <summary>
+        /// Initialize TWAIN session without window handle (for console/service apps).
+        /// </summary>
+        public void Initialize()
+        {
+            var appId = TWIdentity.CreateFromAssembly(DataGroups.Image, Assembly.GetExecutingAssembly());
+            _session = new TwainSession(appId);
+            _session.Open();
+
+            // Subscribe to TWAIN events
+            _session.TransferReady += Session_TransferReady;
+            _session.DataTransferred += Session_DataTransferred;
+            _session.TransferError += Session_TransferError;
+            _session.SourceDisabled += Session_SourceDisabled;
+
+            _logger?.LogInformation("TWAIN session initialized (no window handle)");
+        }
+
+        /// <summary>
+        /// Get all available TWAIN scanners.
+        /// </summary>
         public List<ScannerDevice> GetAllScanners()
         {
             var result = new List<ScannerDevice>();
 
-            var deviceInfos = _deviceManager.DeviceInfos;
-
-            for (int i = 0; i < deviceInfos.Count; i++)
+            if (_session == null)
             {
-                var info = deviceInfos[i + 1];
+                throw new ScanXException("TWAIN session not initialized. Call Initialize() first.",
+                    ScanXExceptionCodes.UnkownError);
+            }
 
-                if (info.Type == WiaDeviceType.ScannerDeviceType)
+            foreach (var source in _session.GetSources())
+            {
+                result.Add(new ScannerDevice
                 {
-                    result.Add(new ScannerDevice()
-                    {
-                        DeviceId = info.DeviceID,
-                        Name = info.Properties["Name"].get_Value().ToString(),
-                        Description = info.Properties["Description"]?.get_Value()?.ToString(),
-                        Port = info.Properties["Port"]?.get_Value()?.ToString()
-                    });
-                }
+                    DeviceId = source.Name,
+                    Name = source.Name,
+                    Description = $"{source.Manufacturer} - {source.ProductFamily}",
+                    Port = source.Version.Info
+                });
             }
 
             return result;
         }
 
-        public void Scan(string deviceID, ScanSetting setting = null, bool scanAllPages = false)
+        /// <summary>
+        /// Scan documents using TWAIN. Properly handles ADF multi-page scanning.
+        /// </summary>
+        /// <param name="deviceName">The TWAIN source name</param>
+        /// <param name="setting">Scan settings</param>
+        /// <param name="scanAllPages">If true, scans all pages in ADF</param>
+        public void Scan(string deviceName, ScanSetting setting = null, bool scanAllPages = false)
         {
+            if (_session == null)
+            {
+                throw new ScanXException("TWAIN session not initialized. Call Initialize() first.",
+                    ScanXExceptionCodes.UnkownError);
+            }
+
             if (setting == null)
                 setting = new ScanSetting();
 
-            int page = 1;
+            _currentSettings = setting;
+            _pageCount = 0;
+            _scanException = null;
+            _scanCompleteEvent.Reset();
+            _scannedImages.Clear();
 
-            IDeviceInfo device = GetDeviceById(deviceID);
+            // Find and open the data source
+            _currentSource = _session.GetSources()
+                .FirstOrDefault(s => s.Name == deviceName);
 
-            Device connectedDevice = null;
+            if (_currentSource == null)
+            {
+                throw new ScanXException($"Scanner '{deviceName}' not found.",
+                    ScanXExceptionCodes.NoDevice);
+            }
 
             try
             {
-                connectedDevice = device.Connect();
-
-                SetDeviceSettings(connectedDevice, setting);
-
-                do
+                var openResult = _currentSource.Open();
+                if (openResult != ReturnCode.Success)
                 {
-                    page = ScanImage(connectedDevice, page, setting);
+                    throw new ScanXException($"Failed to open scanner: {openResult}",
+                        ScanXExceptionCodes.DeviceBusy);
                 }
-                while (scanAllPages);
-            }
-            catch (COMException ex)
-            {
-                var excpetion = GetException(ex);
 
-                _logger?.LogError(ex.ToString());
+                _logger?.LogInformation($"Opened TWAIN source: {deviceName}");
 
-                if (page != 1 && excpetion.Code != ScanXExceptionCodes.NoPaper)
-                    throw excpetion;
+                // Configure scanner settings
+                ConfigureSource(_currentSource, setting, scanAllPages);
 
-            }
-            catch (Exception ex)
-            {
-                _logger?.LogError(ex.ToString());
-
-                throw new ScanXException($"Error: {ex.ToString()}", ex, ScanXExceptionCodes.UnkownError);
-            }
-        }
-
-        private int ScanImage(Device connectedDevice, int page, ScanSetting setting)
-        {
-            var img = (ImageFile)connectedDevice.Items[1].Transfer(FormatID.wiaFormatJPEG);
-
-            byte[] data = (byte[])img.FileData.get_BinaryData();
-
-            byte[] dataConverted = null;
-
-            dataConverted = CompressImageBytes(data);
-
-            var args = new DeviceImageScannedEventArgs(dataConverted, img.FileExtension, page)
-            {
-                Height = img.Height,
-                Width = img.Width,
-                Settings = setting
-            };
-
-            OnImageScanned?.Invoke(this, args);
-
-            page++;
-            return page;
-        }
-
-        private byte[] CompressImageBytes(byte[] data)
-        {
-            byte[] dataConverted;
-            using (MemoryStream writeMs = new MemoryStream())
-            using (MemoryStream ms = new MemoryStream(data))
-            {
-                Bitmap bit = new Bitmap(ms);
-                bit.Save(writeMs, ImageFormat.Jpeg);
-                dataConverted = writeMs.ToArray();
-            }
-
-            return dataConverted;
-        }
-
-        public void ScanWithUI(int deviceID)
-        {
-            CommonDialogClass dlg = new CommonDialogClass();
-
-
-        }
-
-        public string GetDefualtPrinter()
-        {
-            var defualtPrinter = new PrinterSettings();
-
-            return defualtPrinter.PrinterName;
-        }
-
-        public void Print(string imageLocation, PrintSettings setting = null)
-        {
-            Print(imageLocation, GetDefualtPrinter(), setting);
-        }
-
-        public void Print(string imageLocation, string deviceID, PrintSettings setting = null)
-        {
-            if (setting == null)
-                setting = new PrintSettings();
-
-            try
-            {
-                PrintDocument pd = new PrintDocument();
-                pd.PrinterSettings.PrinterName = deviceID;
-                pd.DocumentName = imageLocation;
-                pd.PrintPage += PrintPage;
-                pd.Print();
-            }
-            catch (Exception ex)
-            {
-                _logger?.LogError(ex.ToString());
-
-                throw new ScanXException($"Error: {ex.ToString()}", ex, ScanXExceptionCodes.UnkownError);
-            }
-        }
-
-        private void PrintPage(object sender, PrintPageEventArgs e)
-        {
-            string imageLocation = ((PrintDocument)sender).DocumentName; // Current file name 
-            System.Drawing.Image img = System.Drawing.Image.FromFile(imageLocation);
-            Point loc = new Point(100, 100);
-            e.Graphics.DrawImage(img, loc);
-        }
-
-        public List<DeviceProperty> GetDeviceProperties(string id)
-        {
-            List<DeviceProperty> result = new List<DeviceProperty>();
-
-            IDeviceInfo device = GetDeviceById(id);
-
-            foreach (IProperty item in device.Properties)
-            {
-                result.Add(new DeviceProperty()
+                // Start scanning - this enables the source
+                var enableResult = _currentSource.Enable(SourceEnableMode.NoUI, false, IntPtr.Zero);
+                if (enableResult != ReturnCode.Success)
                 {
-                    Id = item.PropertyID,
-                    Name = item.Name,
-                    Value = item.get_Value()
-                });
-            }
+                    throw new ScanXException($"Failed to start scanning: {enableResult}",
+                        ScanXExceptionCodes.UnkownError);
+                }
 
-            return result;
+                _logger?.LogInformation("Scanning started...");
+
+                // Wait for scanning to complete (with timeout)
+                if (!_scanCompleteEvent.Wait(TimeSpan.FromMinutes(10)))
+                {
+                    throw new ScanXException("Scan operation timed out.",
+                        ScanXExceptionCodes.UnkownError);
+                }
+
+                // Check if there was an error during scanning
+                if (_scanException != null)
+                {
+                    throw _scanException;
+                }
+
+                _logger?.LogInformation($"Scanning completed. Total pages: {_pageCount}");
+            }
+            finally
+            {
+                if (_currentSource != null && _currentSource.IsOpen)
+                {
+                    _currentSource.Close();
+                }
+            }
         }
 
-        public List<DeviceProperty> GetDeviceConnectProperties(string id)
+        private void ConfigureSource(DataSource source, ScanSetting setting, bool scanAllPages)
         {
-            List<DeviceProperty> result = new List<DeviceProperty>();
+            var caps = source.Capabilities;
 
-            IDeviceInfo device = GetDeviceById(id);
-
-            var connectedDevice = device.Connect();
-
-            foreach (IProperty item in connectedDevice.Properties)
+            // Set pixel type (color mode)
+            if (caps.ICapPixelType.IsSupported)
             {
-                result.Add(new DeviceProperty()
+                var pixelType = setting.Color switch
                 {
-                    Id = item.PropertyID,
-                    Name = item.Name,
-                    Value = item.get_Value()
-                });
+                    ScanSetting.ColorModel.Color => PixelType.RGB,
+                    ScanSetting.ColorModel.Grayscale => PixelType.Gray,
+                    ScanSetting.ColorModel.BlackAndWhite => PixelType.BlackWhite,
+                    _ => PixelType.RGB
+                };
+
+                caps.ICapPixelType.SetValue(pixelType);
+                _logger?.LogInformation($"Set pixel type: {pixelType}");
             }
 
-            result = result.OrderBy(a => a.Name).ToList();
-
-            return result;
-        }
-
-        public List<DeviceProperty> GetItemDeviceConnectProperties(string id)
-        {
-            List<DeviceProperty> result = new List<DeviceProperty>();
-
-            IDeviceInfo device = GetDeviceById(id);
-
-            var connectedDevice = device.Connect();
-            
-            foreach (IProperty item in connectedDevice.Items[1].Properties)
+            // Set resolution (DPI)
+            if (caps.ICapXResolution.IsSupported && caps.ICapYResolution.IsSupported)
             {
-                result.Add(new DeviceProperty()
-                {
-                    Id = item.PropertyID,
-                    Name = item.Name,
-                    Value = item.get_Value()
-                });
+                var dpi = ScanSetting.GetResolution(setting.Dpi);
+                caps.ICapXResolution.SetValue(dpi);
+                caps.ICapYResolution.SetValue(dpi);
+                _logger?.LogInformation($"Set resolution: {dpi} DPI");
             }
 
-            result = result.OrderBy(a => a.Name).ToList();
-
-            return result;
-        }
-
-        private IDeviceInfo GetDeviceById(string deviceID)
-        {
-            if (string.IsNullOrWhiteSpace(deviceID))
-                throw new ScanXException("Please select a scanner device", ScanXExceptionCodes.NoDevice);
-
-            var count = _deviceManager.DeviceInfos.Count;
-
-            for (int i = 0; i < count; i++)
+            // Configure for ADF (Automatic Document Feeder)
+            if (caps.CapFeederEnabled.IsSupported)
             {
-                IDeviceInfo device = _deviceManager.DeviceInfos[i + 1];
+                caps.CapFeederEnabled.SetValue(true);
+                _logger?.LogInformation("Enabled document feeder");
+            }
 
-                if (device.DeviceID == deviceID)
+            // Set to scan all pages in feeder
+            if (scanAllPages && caps.CapXferCount.IsSupported)
+            {
+                // -1 means scan all pages until feeder is empty
+                caps.CapXferCount.SetValue(-1);
+                _logger?.LogInformation("Set to scan all pages from feeder");
+            }
+            else if (caps.CapXferCount.IsSupported)
+            {
+                caps.CapXferCount.SetValue(1);
+                _logger?.LogInformation("Set to scan single page");
+            }
+
+            // Enable auto feed if available
+            if (caps.CapAutoFeed.IsSupported)
+            {
+                caps.CapAutoFeed.SetValue(true);
+                _logger?.LogInformation("Enabled auto feed");
+            }
+
+            // Set paper size to A4 if supported
+            if (caps.ICapSupportedSizes.IsSupported)
+            {
+                try
                 {
-                    return device;
+                    caps.ICapSupportedSizes.SetValue(SupportedSize.A4);
+                    _logger?.LogInformation("Set paper size: A4");
+                }
+                catch
+                {
+                    _logger?.LogWarning("Could not set paper size to A4");
                 }
             }
 
-            throw new ScanXException($"No scanner device named: {deviceID} found", ScanXExceptionCodes.NoDevice);
+            // Set image format to JPEG or BMP
+            if (caps.ICapImageFileFormat.IsSupported)
+            {
+                try
+                {
+                    caps.ICapImageFileFormat.SetValue(FileFormat.Jfif);
+                    _logger?.LogInformation("Set image format: JPEG");
+                }
+                catch
+                {
+                    _logger?.LogWarning("Could not set image format to JPEG");
+                }
+            }
         }
 
-        private void SetDeviceSettings(Device connectedDevice, ScanSetting setting)
+        private void Session_TransferReady(object sender, TransferReadyEventArgs e)
         {
-
-            var (width, height) = ScanSetting.GetA4SizeByDpi((int)setting.Dpi);
-
-            var resoultions = ScanSetting.GetResolution(setting.Dpi);
-
-            var properties = connectedDevice.Items[1].Properties;
-
-            SetWIAProperty(properties, ScanSetting.WIA_ITEM_SIZE, 0);
-
-            SetWIAProperty(properties, ScanSetting.WIA_PAGE_SIZE, 3);
-            
-            SetWIAProperty(properties, ScanSetting.WIA_HORIZONTAL_RESOLUTION, resoultions);
-
-            SetWIAProperty(properties, ScanSetting.WIA_VERTICAL_RESOLUTION, resoultions);
-
-            SetWIAProperty(properties, ScanSetting.WIA_VERTICAL_EXTENT, height);
-
-            SetWIAProperty(properties, ScanSetting.WIA_HORIZONTAL_EXTENT, width);
-
-            SetWIAProperty(properties, ScanSetting.WIA_COLOR_MODE, (int)setting.Color);
-
+            _logger?.LogInformation($"Transfer ready. Pending count: {e.PendingTransferCount}");
         }
 
-        private void SetWIAProperty(IProperties properties, int propertyId, object value)
+        private void Session_DataTransferred(object sender, DataTransferredEventArgs e)
         {
+            _pageCount++;
+            _logger?.LogInformation($"Page {_pageCount} transferred");
+
             try
             {
-                for (int i = 0; i < properties.Count; i++)
-                {
-                    var index = i + 1;
+                byte[] imageBytes = null;
 
-                    if (properties[index].PropertyID.Equals(propertyId))
+                // Handle native transfer (DIB/bitmap)
+                if (e.NativeData != IntPtr.Zero)
+                {
+                    using (var stream = e.GetNativeImageStream())
                     {
-                        properties[index].set_Value(value);
+                        if (stream != null)
+                        {
+                            imageBytes = ConvertToJpeg(stream);
+                        }
+                    }
+                }
+                // Handle memory transfer
+                else if (e.MemoryData != null && e.MemoryData.Length > 0)
+                {
+                    using (var stream = new MemoryStream(e.MemoryData))
+                    {
+                        imageBytes = ConvertToJpeg(stream);
+                    }
+                }
+                // Handle file transfer
+                else if (!string.IsNullOrEmpty(e.FileDataPath) && File.Exists(e.FileDataPath))
+                {
+                    using (var stream = File.OpenRead(e.FileDataPath))
+                    {
+                        imageBytes = ConvertToJpeg(stream);
+                    }
+                }
+
+                if (imageBytes != null && imageBytes.Length > 0)
+                {
+                    _scannedImages.Add(imageBytes);
+
+                    var args = new DeviceImageScannedEventArgs(imageBytes, ".jpg", _pageCount)
+                    {
+                        Settings = _currentSettings
+                    };
+
+                    // Get dimensions from the image
+                    try
+                    {
+                        using (var ms = new MemoryStream(imageBytes))
+                        using (var img = Image.FromStream(ms))
+                        {
+                            args.Width = img.Width;
+                            args.Height = img.Height;
+                        }
+                    }
+                    catch
+                    {
+                        // Ignore dimension errors
                     }
 
-                    Debug.WriteLine($"{properties[index].Name}: {properties[index].PropertyID}");
+                    OnImageScanned?.Invoke(this, args);
+                }
+                else
+                {
+                    _logger?.LogWarning($"Page {_pageCount}: No image data received");
                 }
             }
             catch (Exception ex)
             {
-                var msg = $"unable to set properties: {ex}";
-
-                _logger?.LogWarning(msg);
-
-                Debug.WriteLine(msg);
+                _logger?.LogError($"Error processing page {_pageCount}: {ex}");
             }
-
         }
 
-        private ScanXException GetException(COMException ex)
+        private byte[] ConvertToJpeg(Stream inputStream)
         {
-            uint errorCode = (uint)ex.HResult;
-
-            switch (errorCode)
+            using (var image = Image.FromStream(inputStream))
+            using (var outputStream = new MemoryStream())
             {
-                case 0x80210006:
+                // Get JPEG encoder
+                var jpegEncoder = ImageCodecInfo.GetImageEncoders()
+                    .FirstOrDefault(c => c.FormatID == ImageFormat.Jpeg.Guid);
 
-                    return new ScanXException("The device is busy. Close any apps that are using this device or wait for it to finish and then try again.", ScanXExceptionCodes.DeviceBusy);
+                if (jpegEncoder != null)
+                {
+                    var encoderParams = new EncoderParameters(1);
+                    encoderParams.Param[0] = new EncoderParameter(Encoder.Quality, 85L);
+                    image.Save(outputStream, jpegEncoder, encoderParams);
+                }
+                else
+                {
+                    image.Save(outputStream, ImageFormat.Jpeg);
+                }
 
-                case 0x80210016:
-
-                    return new ScanXException("One or more of the device’s cover is open", ScanXExceptionCodes.CoverOpen);
-
-                case 0x8021000A:
-
-                    return new ScanXException("Communication with the WIA device failed. Make sure that the device is powered on and connected to the PC. If the problem persists, disconnect and reconnect the device.", ScanXExceptionCodes.CommunicationWithDeviceFailed);
-
-                case 0x8021000D:
-
-                    return new ScanXException("The device is locked. Close any apps that are using this device or wait for it to finish and then try again.", ScanXExceptionCodes.DeviceLocked);
-
-                case 0x8021000E:
-
-                    return new ScanXException("The device driver threw an exception.", ScanXExceptionCodes.DeviceDriverError);
-
-                case 0x80210001:
-
-                    return new ScanXException("An unknown error has occurred with the WIA device.", ScanXExceptionCodes.UnkownError);
-
-                case 0x8021000C:
-
-                    return new ScanXException("There is an incorrect setting on the WIA device.", ScanXExceptionCodes.IconrrectSetting);
-
-                case 0x8021000B:
-
-                    return new ScanXException("The device doesn't support this command.", ScanXExceptionCodes.NotSupportedCommand);
-
-                case 0x8021000F:
-
-                    return new ScanXException("The response from the driver is invalid.", ScanXExceptionCodes.DeviceDriverInvlid);
-
-                case 0x80210009:
-
-                    return new ScanXException("The WIA device was deleted. It's no longer available.", ScanXExceptionCodes.ItemDeleted);
-
-                case 0x80210017:
-
-                    return new ScanXException("The scanner's lamp is off.", ScanXExceptionCodes.ScannerLampIsOff);
-
-                case 0x80210021:
-
-                    return new ScanXException("A scan job was interrupted because an Imprinter/Endorser item reached the maximum valid value for WIA_IPS_PRINTER_ENDORSER_COUNTER, and was reset to 0.", ScanXExceptionCodes.ScannerInterupted);
-
-                case 0x80210020:
-
-                    return new ScanXException("A scan error occurred because of a multiple page feed condition.", ScanXExceptionCodes.MultipageFeedCondition);
-
-                case 0x80210005:
-
-                    return new ScanXException("The device is offline. Make sure the device is powered on and connected to the PC.", ScanXExceptionCodes.DeviceOffline);
-
-                case 0x80210003:
-
-                    return new ScanXException("There are no documents in the document feeder.", ScanXExceptionCodes.NoPaper);
-
-                case 0x80210002:
-
-                    return new ScanXException("Paper is jammed in the scanner's document feeder.", ScanXExceptionCodes.PaperJammed);
-
-                case 0x80210004:
-
-                    return new ScanXException("An unspecified problem occurred with the scanner's document feeder.", ScanXExceptionCodes.DocumentFeeder);
-
-                case 0x80210007:
-
-                    return new ScanXException("The device is warming up.", ScanXExceptionCodes.DeviceIsWarmpingUp);
-
-                case 0x80210008:
-
-                    return new ScanXException("There is a problem with the WIA device. Make sure that the device is turned on, online, and any cables are properly connected.", ScanXExceptionCodes.DeviceOffline);
-
-                case 0x80210015:
-
-                    return new ScanXException("No scanner device was found. Make sure the device is online, connected to the PC, and has the correct driver installed on the PC.", ScanXExceptionCodes.NoDevice);
-
-                default:
-                    return new ScanXException("Unkown Error", ex, ScanXExceptionCodes.UnkownError);
+                return outputStream.ToArray();
             }
+        }
+
+        private void Session_TransferError(object sender, TransferErrorEventArgs e)
+        {
+            _logger?.LogError($"Transfer error: {e.Exception?.Message ?? "Unknown error"}");
+
+            // Map TWAIN errors to ScanX exceptions
+            var errorCode = e.Exception?.Message?.ToLower() ?? "";
+
+            if (errorCode.Contains("paper") && errorCode.Contains("jam"))
+            {
+                _scanException = new ScanXException("Paper is jammed in the scanner's document feeder.",
+                    ScanXExceptionCodes.PaperJammed);
+            }
+            else if (errorCode.Contains("no paper") || errorCode.Contains("empty"))
+            {
+                // No paper is expected at end of ADF scanning - not an error
+                if (_pageCount == 0)
+                {
+                    _scanException = new ScanXException("There are no documents in the document feeder.",
+                        ScanXExceptionCodes.NoPaper);
+                }
+                // If we've scanned pages, this just means we're done
+            }
+            else if (errorCode.Contains("cover") && errorCode.Contains("open"))
+            {
+                _scanException = new ScanXException("One or more of the device's covers is open.",
+                    ScanXExceptionCodes.CoverOpen);
+            }
+            else if (e.Exception != null)
+            {
+                _scanException = new ScanXException($"Scan error: {e.Exception.Message}",
+                    e.Exception, ScanXExceptionCodes.UnkownError);
+            }
+        }
+
+        private void Session_SourceDisabled(object sender, EventArgs e)
+        {
+            _logger?.LogInformation("Source disabled - scanning complete");
+            _scanCompleteEvent.Set();
         }
 
         public void Dispose()
         {
-            Marshal.ReleaseComObject(_deviceManager);
+            if (_disposed) return;
+            _disposed = true;
+
+            try
+            {
+                if (_currentSource != null && _currentSource.IsOpen)
+                {
+                    _currentSource.Close();
+                }
+
+                if (_session != null && _session.State > 2)
+                {
+                    _session.Close();
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError($"Error disposing TWAIN client: {ex}");
+            }
+
+            _scanCompleteEvent?.Dispose();
         }
     }
 }

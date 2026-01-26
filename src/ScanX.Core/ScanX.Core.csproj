@@ -10,12 +10,4 @@
     <PackageReference Include="NTwain" Version="3.7.2" />
   </ItemGroup>
 
-  <ItemGroup>
-    <Reference Include="Interop.WIA">
-      <HintPath>..\..\lib\Interop.WIA.dll</HintPath>
-      <EmbedInteropTypes>false</EmbedInteropTypes>
-      <Private>true</Private>
-    </Reference>
-  </ItemGroup>
-
 </Project>

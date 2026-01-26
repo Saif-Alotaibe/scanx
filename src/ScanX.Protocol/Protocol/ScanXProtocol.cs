@@ -19,8 +19,8 @@ namespace ScanX.Protocol.Protocol
     public class ScanXProtocol : Hub
     {
         private readonly ILogger _logger;
-        private static TwainDeviceClient _twainClient;
-        private static readonly object _twainLock = new object();
+        private static DeviceClient _client;
+        private static readonly object _clientLock = new object();
 
         public ScanXProtocol(ILogger<ScanXProtocol> logger)
         {
@@ -46,7 +46,7 @@ namespace ScanX.Protocol.Protocol
             var imagesPath = Path.Combine(dir, "wwwroot", "images");
 
             await Clients.Caller.SendAsync(ClientMethod.ON_LOG, imagesPath);
-            
+
             var img1 = File.ReadAllBytes($"{imagesPath}\\1.png");
             var img2 = File.ReadAllBytes($"{imagesPath}\\2.png");
             var img3 = File.ReadAllBytes($"{imagesPath}\\3.png");
@@ -59,101 +59,26 @@ namespace ScanX.Protocol.Protocol
             var result4 = new DeviceImageScannedEventArgs(img4, ".png", 4);
             var result5 = new DeviceImageScannedEventArgs(img2, ".jpg", 5);
 
-
-
             await Clients.Caller.SendAsync(ClientMethod.ON_IMAGE_SCANNED, result1);
             await Clients.Caller.SendAsync(ClientMethod.ON_IMAGE_SCANNED, result2);
             await Clients.Caller.SendAsync(ClientMethod.ON_IMAGE_SCANNED, result3);
             await Clients.Caller.SendAsync(ClientMethod.ON_IMAGE_SCANNED, result4);
             await Clients.Caller.SendAsync(ClientMethod.ON_IMAGE_SCANNED, result5);
 
-
-
             await Clients.Caller.SendAsync(ClientMethod.ON_SCAN_FINISHED);
         }
 
-        public async Task ScanSingle(string deviceId,ScanSetting settings)
-        {
-            using (DeviceClient client = new DeviceClient(_logger))
-            {
-                RegisterImageScannedEvents(client);
-
-                await TryInvoke(() => client.Scan(deviceId, settings));
-
-                await Clients.Caller.SendAsync(ClientMethod.ON_SCAN_FINISHED);
-            }
-        }
-        
-        public async Task ScanMultiple(string deviceId,ScanSetting settings)
-        {
-            using (DeviceClient client = new DeviceClient(_logger))
-            {
-
-                RegisterImageScannedEvents(client);
-
-                await TryInvoke(() => client.Scan(deviceId, settings, true));
-
-                await Clients.Caller.SendAsync(ClientMethod.ON_SCAN_FINISHED);
-            }
-        }
-        
-        private async Task TryInvoke(Action action)
-        {
-            try
-            {
-                action.Invoke();
-
-            }
-            catch (ScanXException ex)
-            {
-                _logger?.LogError(ex.ToString());
-
-                await Clients.Caller.SendAsync(ClientMethod.ON_ERROR, ex);
-            }
-        }
-
-        private void RegisterImageScannedEvents(DeviceClient client)
-        {
-            client.OnImageScanned += async (sender, args) =>
-            {
-                var data = args as DeviceImageScannedEventArgs;
-
-                await Clients.Caller.SendAsync(ClientMethod.ON_IMAGE_SCANNED, data);
-            };
-        }
-
-        #region TWAIN Methods
-
         /// <summary>
-        /// Get all available TWAIN scanners.
+        /// Scan a single page using TWAIN.
         /// </summary>
-        public async Task<List<ScannerDevice>> GetTwainScanners()
+        public async Task ScanSingle(string deviceId, ScanSetting settings)
         {
             try
             {
-                EnsureTwainInitialized();
-                return _twainClient.GetAllScanners();
-            }
-            catch (Exception ex)
-            {
-                _logger?.LogError($"Error getting TWAIN scanners: {ex}");
-                await Clients.Caller.SendAsync(ClientMethod.ON_ERROR,
-                    new ScanXException($"Failed to get TWAIN scanners: {ex.Message}", ScanXExceptionCodes.UnkownError));
-                return new List<ScannerDevice>();
-            }
-        }
+                EnsureClientInitialized();
+                RegisterImageScannedEvents();
 
-        /// <summary>
-        /// Scan a single page using TWAIN (reliable for document scanners like fi-8170).
-        /// </summary>
-        public async Task TwainScanSingle(string deviceName, ScanSetting settings)
-        {
-            try
-            {
-                EnsureTwainInitialized();
-                RegisterTwainImageScannedEvents();
-
-                await Task.Run(() => _twainClient.Scan(deviceName, settings, false));
+                await Task.Run(() => _client.Scan(deviceId, settings, false));
 
                 await Clients.Caller.SendAsync(ClientMethod.ON_SCAN_FINISHED);
             }
@@ -166,21 +91,21 @@ namespace ScanX.Protocol.Protocol
             {
                 _logger?.LogError(ex.ToString());
                 await Clients.Caller.SendAsync(ClientMethod.ON_ERROR,
-                    new ScanXException($"TWAIN scan error: {ex.Message}", ScanXExceptionCodes.UnkownError));
+                    new ScanXException($"Scan error: {ex.Message}", ScanXExceptionCodes.UnkownError));
             }
         }
 
         /// <summary>
-        /// Scan all pages in ADF using TWAIN (reliable for document scanners like fi-8170).
+        /// Scan all pages from ADF using TWAIN.
         /// </summary>
-        public async Task TwainScanMultiple(string deviceName, ScanSetting settings)
+        public async Task ScanMultiple(string deviceId, ScanSetting settings)
         {
             try
             {
-                EnsureTwainInitialized();
-                RegisterTwainImageScannedEvents();
+                EnsureClientInitialized();
+                RegisterImageScannedEvents();
 
-                await Task.Run(() => _twainClient.Scan(deviceName, settings, true));
+                await Task.Run(() => _client.Scan(deviceId, settings, true));
 
                 await Clients.Caller.SendAsync(ClientMethod.ON_SCAN_FINISHED);
             }
@@ -193,37 +118,35 @@ namespace ScanX.Protocol.Protocol
             {
                 _logger?.LogError(ex.ToString());
                 await Clients.Caller.SendAsync(ClientMethod.ON_ERROR,
-                    new ScanXException($"TWAIN scan error: {ex.Message}", ScanXExceptionCodes.UnkownError));
+                    new ScanXException($"Scan error: {ex.Message}", ScanXExceptionCodes.UnkownError));
             }
         }
 
-        private void EnsureTwainInitialized()
+        private void EnsureClientInitialized()
         {
-            lock (_twainLock)
+            lock (_clientLock)
             {
-                if (_twainClient == null)
+                if (_client == null)
                 {
-                    _twainClient = new TwainDeviceClient(_logger);
-                    _twainClient.Initialize();
+                    _client = new DeviceClient(_logger);
+                    _client.Initialize();
                     _logger?.LogInformation("TWAIN client initialized");
                 }
             }
         }
 
-        private void RegisterTwainImageScannedEvents()
+        private void RegisterImageScannedEvents()
         {
             // Remove existing handlers to prevent duplicates
-            _twainClient.OnImageScanned -= TwainClient_OnImageScanned;
-            _twainClient.OnImageScanned += TwainClient_OnImageScanned;
+            _client.OnImageScanned -= Client_OnImageScanned;
+            _client.OnImageScanned += Client_OnImageScanned;
         }
 
-        private async void TwainClient_OnImageScanned(object sender, EventArgs args)
+        private async void Client_OnImageScanned(object sender, EventArgs args)
         {
             var data = args as DeviceImageScannedEventArgs;
             await Clients.Caller.SendAsync(ClientMethod.ON_IMAGE_SCANNED, data);
         }
-
-        #endregion
 
     }
 }
