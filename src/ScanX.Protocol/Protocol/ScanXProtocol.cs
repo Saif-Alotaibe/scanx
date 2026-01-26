@@ -1,4 +1,4 @@
-﻿using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.Logging;
 using ScanX.Core;
@@ -19,6 +19,8 @@ namespace ScanX.Protocol.Protocol
     public class ScanXProtocol : Hub
     {
         private readonly ILogger _logger;
+        private static TwainDeviceClient _twainClient;
+        private static readonly object _twainLock = new object();
 
         public ScanXProtocol(ILogger<ScanXProtocol> logger)
         {
@@ -119,6 +121,109 @@ namespace ScanX.Protocol.Protocol
                 await Clients.Caller.SendAsync(ClientMethod.ON_IMAGE_SCANNED, data);
             };
         }
+
+        #region TWAIN Methods
+
+        /// <summary>
+        /// Get all available TWAIN scanners.
+        /// </summary>
+        public async Task<List<ScannerDevice>> GetTwainScanners()
+        {
+            try
+            {
+                EnsureTwainInitialized();
+                return _twainClient.GetAllScanners();
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError($"Error getting TWAIN scanners: {ex}");
+                await Clients.Caller.SendAsync(ClientMethod.ON_ERROR,
+                    new ScanXException($"Failed to get TWAIN scanners: {ex.Message}", ScanXExceptionCodes.UnkownError));
+                return new List<ScannerDevice>();
+            }
+        }
+
+        /// <summary>
+        /// Scan a single page using TWAIN (reliable for document scanners like fi-8170).
+        /// </summary>
+        public async Task TwainScanSingle(string deviceName, ScanSetting settings)
+        {
+            try
+            {
+                EnsureTwainInitialized();
+                RegisterTwainImageScannedEvents();
+
+                await Task.Run(() => _twainClient.Scan(deviceName, settings, false));
+
+                await Clients.Caller.SendAsync(ClientMethod.ON_SCAN_FINISHED);
+            }
+            catch (ScanXException ex)
+            {
+                _logger?.LogError(ex.ToString());
+                await Clients.Caller.SendAsync(ClientMethod.ON_ERROR, ex);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex.ToString());
+                await Clients.Caller.SendAsync(ClientMethod.ON_ERROR,
+                    new ScanXException($"TWAIN scan error: {ex.Message}", ScanXExceptionCodes.UnkownError));
+            }
+        }
+
+        /// <summary>
+        /// Scan all pages in ADF using TWAIN (reliable for document scanners like fi-8170).
+        /// </summary>
+        public async Task TwainScanMultiple(string deviceName, ScanSetting settings)
+        {
+            try
+            {
+                EnsureTwainInitialized();
+                RegisterTwainImageScannedEvents();
+
+                await Task.Run(() => _twainClient.Scan(deviceName, settings, true));
+
+                await Clients.Caller.SendAsync(ClientMethod.ON_SCAN_FINISHED);
+            }
+            catch (ScanXException ex)
+            {
+                _logger?.LogError(ex.ToString());
+                await Clients.Caller.SendAsync(ClientMethod.ON_ERROR, ex);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex.ToString());
+                await Clients.Caller.SendAsync(ClientMethod.ON_ERROR,
+                    new ScanXException($"TWAIN scan error: {ex.Message}", ScanXExceptionCodes.UnkownError));
+            }
+        }
+
+        private void EnsureTwainInitialized()
+        {
+            lock (_twainLock)
+            {
+                if (_twainClient == null)
+                {
+                    _twainClient = new TwainDeviceClient(_logger);
+                    _twainClient.Initialize();
+                    _logger?.LogInformation("TWAIN client initialized");
+                }
+            }
+        }
+
+        private void RegisterTwainImageScannedEvents()
+        {
+            // Remove existing handlers to prevent duplicates
+            _twainClient.OnImageScanned -= TwainClient_OnImageScanned;
+            _twainClient.OnImageScanned += TwainClient_OnImageScanned;
+        }
+
+        private async void TwainClient_OnImageScanned(object sender, EventArgs args)
+        {
+            var data = args as DeviceImageScannedEventArgs;
+            await Clients.Caller.SendAsync(ClientMethod.ON_IMAGE_SCANNED, data);
+        }
+
+        #endregion
 
     }
 }

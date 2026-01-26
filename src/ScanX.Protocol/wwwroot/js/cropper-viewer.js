@@ -83,6 +83,7 @@ function setImageToViewer(data) {
 function scanSingle() {
 
     var deviceId = $("#select-scanner-drp").val();
+    var driver = $("#drp-driver").val();
 
     var settings = {
 
@@ -92,12 +93,19 @@ function scanSingle() {
 
     }
 
-    scan.scanSingle(deviceId, settings);
+    if (driver === "twain") {
+        // Use TWAIN for reliable ADF scanning (recommended for fi-8170)
+        scan.twainScanSingle(deviceId, settings);
+    } else {
+        // Use WIA (basic, may have issues with some ADF scanners)
+        scan.scanSingle(deviceId, settings);
+    }
 }
 
 function scanImage() {
 
     var deviceId = $("#select-scanner-drp").val();
+    var driver = $("#drp-driver").val();
 
     var settings = {
 
@@ -107,5 +115,11 @@ function scanImage() {
 
     }
 
-    scan.scanMultiple(deviceId, settings);
+    if (driver === "twain") {
+        // Use TWAIN for reliable ADF scanning (recommended for fi-8170)
+        scan.twainScanMultiple(deviceId, settings);
+    } else {
+        // Use WIA (basic, may have issues with some ADF scanners)
+        scan.scanMultiple(deviceId, settings);
+    }
 }
