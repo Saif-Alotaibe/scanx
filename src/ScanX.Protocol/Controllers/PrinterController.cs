@@ -25,6 +25,7 @@ namespace ScanX.Protocol.Controllers
 
             using (DeviceClient client = new DeviceClient())
             {
+                client.Initialize();
                 result = client.GetAllPrinters();
             }
             return Ok(result);

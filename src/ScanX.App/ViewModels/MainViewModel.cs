@@ -44,7 +44,10 @@ namespace ScanX.App.ViewModels
             get
             {
                 if (_service == null)
+                {
                     _service = new DeviceClient();
+                    _service.Initialize();
+                }
 
                 return _service;
             }

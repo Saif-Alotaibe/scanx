@@ -68,6 +68,7 @@ namespace ScanX.App.ViewModels
             }
 
             var client = new DeviceClient();
+            client.Initialize();
 
             Properties.Clear();
 
@@ -84,6 +85,7 @@ namespace ScanX.App.ViewModels
             Scanners.Clear();
 
             var client = new DeviceClient();
+            client.Initialize();
 
             var result = client.GetAllScanners();
 

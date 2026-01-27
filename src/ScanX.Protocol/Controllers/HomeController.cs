@@ -22,6 +22,7 @@ namespace ScanX.Protocol.Controllers
 
             using (DeviceClient client = new DeviceClient())
             {
+                client.Initialize();
                 result.Printers = client.GetAllPrinters();
                 result.Scanners = client.GetAllScanners();
             }
@@ -35,9 +36,10 @@ namespace ScanX.Protocol.Controllers
 
             using (DeviceClient client = new DeviceClient())
             {
+                client.Initialize();
                 result = client.GetAllScanners();
             }
-            
+
             return View(result);
         }
         

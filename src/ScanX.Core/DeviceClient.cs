@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Imaging;
+using System.Drawing.Printing;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -45,13 +46,21 @@ namespace ScanX.Core
         }
 
         /// <summary>
-        /// Initialize TWAIN session. Must be called from a UI thread with message pump.
+        /// Initialize TWAIN session with a message loop hook for UI applications.
         /// </summary>
-        public void Initialize(IntPtr windowHandle)
+        /// <param name="messageLoopHook">
+        /// The message loop hook for your UI framework:
+        /// - WinForms: new WindowsFormsMessageLoopHook(yourControl)
+        /// - WPF: new WpfMessageLoopHook(yourWindow)
+        /// </param>
+        public void Initialize(MessageLoopHook messageLoopHook)
         {
+            if (messageLoopHook == null)
+                throw new ArgumentNullException(nameof(messageLoopHook));
+
             var appId = TWIdentity.CreateFromAssembly(DataGroups.Image, Assembly.GetExecutingAssembly());
             _session = new TwainSession(appId);
-            _session.Open(new MessageLoopHook(windowHandle));
+            _session.Open(messageLoopHook);
 
             // Subscribe to TWAIN events
             _session.TransferReady += Session_TransferReady;
@@ -59,7 +68,7 @@ namespace ScanX.Core
             _session.TransferError += Session_TransferError;
             _session.SourceDisabled += Session_SourceDisabled;
 
-            _logger?.LogInformation("TWAIN session initialized");
+            _logger?.LogInformation("TWAIN session initialized with message loop hook");
         }
 
         /// <summary>
@@ -105,6 +114,118 @@ namespace ScanX.Core
             }
 
             return result;
+        }
+
+        /// <summary>
+        /// Get all installed printers.
+        /// </summary>
+        public List<string> GetAllPrinters()
+        {
+            var result = new List<string>();
+
+            var printers = PrinterSettings.InstalledPrinters;
+
+            foreach (string item in printers)
+            {
+                result.Add(item);
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// Get device properties for a connected TWAIN scanner.
+        /// </summary>
+        public List<DeviceProperty> GetItemDeviceConnectProperties(string deviceId)
+        {
+            var result = new List<DeviceProperty>();
+
+            if (_session == null)
+            {
+                throw new ScanXException("TWAIN session not initialized. Call Initialize() first.",
+                    ScanXExceptionCodes.UnkownError);
+            }
+
+            var source = _session.GetSources()
+                .FirstOrDefault(s => s.Name == deviceId);
+
+            if (source == null)
+            {
+                throw new ScanXException($"Scanner '{deviceId}' not found.",
+                    ScanXExceptionCodes.NoDevice);
+            }
+
+            try
+            {
+                var openResult = source.Open();
+                if (openResult != ReturnCode.Success)
+                {
+                    throw new ScanXException($"Failed to open scanner: {openResult}",
+                        ScanXExceptionCodes.DeviceBusy);
+                }
+
+                var caps = source.Capabilities;
+
+                // Add common capabilities as properties
+                if (caps.ICapPixelType.IsSupported)
+                {
+                    result.Add(new DeviceProperty
+                    {
+                        Id = 0,
+                        Name = "PixelType",
+                        Value = caps.ICapPixelType.GetCurrent()
+                    });
+                }
+
+                if (caps.ICapXResolution.IsSupported)
+                {
+                    result.Add(new DeviceProperty
+                    {
+                        Id = 1,
+                        Name = "XResolution",
+                        Value = caps.ICapXResolution.GetCurrent()
+                    });
+                }
+
+                if (caps.ICapYResolution.IsSupported)
+                {
+                    result.Add(new DeviceProperty
+                    {
+                        Id = 2,
+                        Name = "YResolution",
+                        Value = caps.ICapYResolution.GetCurrent()
+                    });
+                }
+
+                if (caps.CapFeederEnabled.IsSupported)
+                {
+                    result.Add(new DeviceProperty
+                    {
+                        Id = 3,
+                        Name = "FeederEnabled",
+                        Value = caps.CapFeederEnabled.GetCurrent()
+                    });
+                }
+
+                if (caps.ICapSupportedSizes.IsSupported)
+                {
+                    result.Add(new DeviceProperty
+                    {
+                        Id = 4,
+                        Name = "SupportedSizes",
+                        Value = caps.ICapSupportedSizes.GetCurrent()
+                    });
+                }
+            }
+            finally
+            {
+                if (source.IsOpen)
+                {
+                    source.Close();
+                }
+            }
+
+            return result.OrderBy(a => a.Name).ToList();
         }
 
         /// <summary>
@@ -195,13 +316,20 @@ namespace ScanX.Core
             // Set pixel type (color mode)
             if (caps.ICapPixelType.IsSupported)
             {
-                var pixelType = setting.Color switch
+                PixelType pixelType;
+                switch (setting.Color)
                 {
-                    ScanSetting.ColorModel.Color => PixelType.RGB,
-                    ScanSetting.ColorModel.Grayscale => PixelType.Gray,
-                    ScanSetting.ColorModel.BlackAndWhite => PixelType.BlackWhite,
-                    _ => PixelType.RGB
-                };
+                    case ScanSetting.ColorModel.Grayscale:
+                        pixelType = PixelType.Gray;
+                        break;
+                    case ScanSetting.ColorModel.BlackAndWhite:
+                        pixelType = PixelType.BlackWhite;
+                        break;
+                    case ScanSetting.ColorModel.Color:
+                    default:
+                        pixelType = PixelType.RGB;
+                        break;
+                }
 
                 caps.ICapPixelType.SetValue(pixelType);
                 _logger?.LogInformation($"Set pixel type: {pixelType}");
@@ -219,7 +347,7 @@ namespace ScanX.Core
             // Configure for ADF (Automatic Document Feeder)
             if (caps.CapFeederEnabled.IsSupported)
             {
-                caps.CapFeederEnabled.SetValue(true);
+                caps.CapFeederEnabled.SetValue(BoolType.True);
                 _logger?.LogInformation("Enabled document feeder");
             }
 
@@ -239,7 +367,7 @@ namespace ScanX.Core
             // Enable auto feed if available
             if (caps.CapAutoFeed.IsSupported)
             {
-                caps.CapAutoFeed.SetValue(true);
+                caps.CapAutoFeed.SetValue(BoolType.True);
                 _logger?.LogInformation("Enabled auto feed");
             }
 
