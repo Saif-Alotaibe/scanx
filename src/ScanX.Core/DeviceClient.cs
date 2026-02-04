@@ -24,6 +24,8 @@ namespace ScanX.Core
     {
         private readonly ILogger _logger;
         private TwainSession _session;
+        private TwainSessionManager _sessionManager;
+        private bool _useSessionManager;
         private DataSource _currentSource;
         private readonly List<byte[]> _scannedImages;
         private readonly ManualResetEventSlim _scanCompleteEvent;
@@ -72,21 +74,28 @@ namespace ScanX.Core
         }
 
         /// <summary>
-        /// Initialize TWAIN session without window handle (for console/service apps).
+        /// Initialize TWAIN session for console/service apps.
+        /// Creates a dedicated STA thread with a message loop for TWAIN compatibility.
         /// </summary>
         public void Initialize()
         {
-            var appId = TWIdentity.CreateFromAssembly(DataGroups.Image, Assembly.GetExecutingAssembly());
-            _session = new TwainSession(appId);
-            _session.Open();
+            // Use the session manager which provides a proper message loop
+            _sessionManager = new TwainSessionManager(_logger);
+            _sessionManager.Start();
 
-            // Subscribe to TWAIN events
-            _session.TransferReady += Session_TransferReady;
-            _session.DataTransferred += Session_DataTransferred;
-            _session.TransferError += Session_TransferError;
-            _session.SourceDisabled += Session_SourceDisabled;
+            _session = _sessionManager.Session;
+            _useSessionManager = true;
 
-            _logger?.LogInformation("TWAIN session initialized (no window handle)");
+            // Subscribe to TWAIN events (must be done on TWAIN thread)
+            _sessionManager.Invoke(() =>
+            {
+                _session.TransferReady += Session_TransferReady;
+                _session.DataTransferred += Session_DataTransferred;
+                _session.TransferError += Session_TransferError;
+                _session.SourceDisabled += Session_SourceDisabled;
+            });
+
+            _logger?.LogInformation("TWAIN session initialized with dedicated message loop thread");
         }
 
         /// <summary>
@@ -94,13 +103,24 @@ namespace ScanX.Core
         /// </summary>
         public List<ScannerDevice> GetAllScanners()
         {
-            var result = new List<ScannerDevice>();
-
             if (_session == null)
             {
                 throw new ScanXException("TWAIN session not initialized. Call Initialize() first.",
                     ScanXExceptionCodes.UnkownError);
             }
+
+            // Execute on TWAIN thread if using session manager
+            if (_useSessionManager)
+            {
+                return _sessionManager.Invoke(() => GetScannersInternal());
+            }
+
+            return GetScannersInternal();
+        }
+
+        private List<ScannerDevice> GetScannersInternal()
+        {
+            var result = new List<ScannerDevice>();
 
             foreach (var source in _session.GetSources())
             {
@@ -113,6 +133,7 @@ namespace ScanX.Core
                 });
             }
 
+            _logger?.LogInformation($"Found {result.Count} TWAIN scanner(s)");
             return result;
         }
 
@@ -138,13 +159,24 @@ namespace ScanX.Core
         /// </summary>
         public List<DeviceProperty> GetItemDeviceConnectProperties(string deviceId)
         {
-            var result = new List<DeviceProperty>();
-
             if (_session == null)
             {
                 throw new ScanXException("TWAIN session not initialized. Call Initialize() first.",
                     ScanXExceptionCodes.UnkownError);
             }
+
+            // Execute on TWAIN thread if using session manager
+            if (_useSessionManager)
+            {
+                return _sessionManager.Invoke(() => GetDevicePropertiesInternal(deviceId));
+            }
+
+            return GetDevicePropertiesInternal(deviceId);
+        }
+
+        private List<DeviceProperty> GetDevicePropertiesInternal(string deviceId)
+        {
+            var result = new List<DeviceProperty>();
 
             var source = _session.GetSources()
                 .FirstOrDefault(s => s.Name == deviceId);
@@ -251,6 +283,19 @@ namespace ScanX.Core
             _scanCompleteEvent.Reset();
             _scannedImages.Clear();
 
+            // Execute scan on TWAIN thread if using session manager
+            if (_useSessionManager)
+            {
+                _sessionManager.Invoke(() => ScanInternal(deviceName, setting, scanAllPages));
+            }
+            else
+            {
+                ScanInternal(deviceName, setting, scanAllPages);
+            }
+        }
+
+        private void ScanInternal(string deviceName, ScanSetting setting, bool scanAllPages)
+        {
             // Find and open the data source
             _currentSource = _session.GetSources()
                 .FirstOrDefault(s => s.Name == deviceName);
@@ -550,14 +595,22 @@ namespace ScanX.Core
 
             try
             {
-                if (_currentSource != null && _currentSource.IsOpen)
+                if (_useSessionManager)
                 {
-                    _currentSource.Close();
+                    // Session manager handles cleanup
+                    _sessionManager?.Dispose();
                 }
-
-                if (_session != null && _session.State > 2)
+                else
                 {
-                    _session.Close();
+                    if (_currentSource != null && _currentSource.IsOpen)
+                    {
+                        _currentSource.Close();
+                    }
+
+                    if (_session != null && _session.State > 2)
+                    {
+                        _session.Close();
+                    }
                 }
             }
             catch (Exception ex)
