@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Extensions.Logging;
@@ -25,6 +27,13 @@ namespace ScanX.Core
         private volatile bool _initialized;
         private Exception _initException;
 
+        // Win32 API for session detection
+        [DllImport("kernel32.dll")]
+        private static extern uint WTSGetActiveConsoleSessionId();
+
+        [DllImport("kernel32.dll")]
+        private static extern bool ProcessIdToSessionId(uint dwProcessId, out uint pSessionId);
+
         public TwainSession Session => _session;
         public bool IsInitialized => _initialized;
 
@@ -36,6 +45,29 @@ namespace ScanX.Core
         }
 
         /// <summary>
+        /// Check if the current process is running in an interactive session (not Session 0).
+        /// Windows Services run in Session 0 and cannot create UI elements.
+        /// </summary>
+        public static bool IsInteractiveSession()
+        {
+            try
+            {
+                uint sessionId;
+                if (ProcessIdToSessionId((uint)Process.GetCurrentProcess().Id, out sessionId))
+                {
+                    // Session 0 is the non-interactive services session
+                    return sessionId != 0;
+                }
+            }
+            catch
+            {
+                // Fall back to Environment check
+            }
+
+            return Environment.UserInteractive;
+        }
+
+        /// <summary>
         /// Start the TWAIN session on a dedicated STA thread.
         /// This method blocks until initialization is complete.
         /// </summary>
@@ -43,6 +75,19 @@ namespace ScanX.Core
         {
             if (_initialized)
                 return;
+
+            _logger?.LogInformation("Starting TWAIN session manager...");
+            _logger?.LogInformation($"Is 64-bit process: {Environment.Is64BitProcess}");
+            _logger?.LogInformation($"Is 64-bit OS: {Environment.Is64BitOperatingSystem}");
+            _logger?.LogInformation($"Is interactive session: {IsInteractiveSession()}");
+            _logger?.LogInformation($"Environment.UserInteractive: {Environment.UserInteractive}");
+
+            // Check for Session 0 (Windows Service) - TWAIN cannot work in Session 0
+            if (!IsInteractiveSession())
+            {
+                _logger?.LogWarning("Running in Session 0 (non-interactive). TWAIN requires an interactive session with desktop access.");
+                _logger?.LogWarning("Consider running as a desktop application instead of a Windows Service, or use a helper process.");
+            }
 
             _twainThread = new Thread(TwainThreadProc)
             {
@@ -70,58 +115,87 @@ namespace ScanX.Core
         {
             try
             {
+                _logger?.LogInformation("TWAIN thread started, creating message window...");
+
                 // Create a hidden form to provide the message loop
                 _messageLoopForm = new Form
                 {
+                    Text = "TWAIN Message Window",
                     ShowInTaskbar = false,
-                    WindowState = FormWindowState.Minimized,
-                    FormBorderStyle = FormBorderStyle.None,
-                    Opacity = 0
+                    FormBorderStyle = FormBorderStyle.FixedToolWindow,
+                    StartPosition = FormStartPosition.Manual,
+                    Location = new System.Drawing.Point(-10000, -10000),
+                    Size = new System.Drawing.Size(1, 1)
                 };
 
-                _messageLoopForm.Load += (s, e) =>
+                // Create the handle immediately
+                var handle = _messageLoopForm.Handle;
+                _logger?.LogInformation($"Message window created. Handle: {handle}");
+
+                if (handle == IntPtr.Zero)
                 {
-                    try
+                    throw new InvalidOperationException("Failed to create message window - handle is zero");
+                }
+
+                // Initialize TWAIN session BEFORE Application.Run
+                try
+                {
+                    _logger?.LogInformation("Creating TWAIN identity...");
+                    var appId = TWIdentity.CreateFromAssembly(
+                        DataGroups.Image,
+                        Assembly.GetExecutingAssembly());
+
+                    _logger?.LogInformation($"TWAIN identity created: {appId.ProductName}");
+
+                    _session = new TwainSession(appId);
+                    _logger?.LogInformation("TwainSession created, opening with message loop hook...");
+
+                    // Open with the form's message loop hook
+                    var hook = new WindowsFormsMessageLoopHook(handle);
+                    _session.Open(hook);
+
+                    _logger?.LogInformation($"TWAIN session opened. State: {_session.State}");
+
+                    // Check the state
+                    if (_session.State < 3)
                     {
-                        // Hide the form
-                        _messageLoopForm.Visible = false;
-                        _messageLoopForm.Size = new System.Drawing.Size(0, 0);
-
-                        // Initialize TWAIN session
-                        var appId = TWIdentity.CreateFromAssembly(
-                            DataGroups.Image,
-                            Assembly.GetExecutingAssembly());
-
-                        _session = new TwainSession(appId);
-
-                        // Open with the form's message loop hook
-                        _session.Open(new WindowsFormsMessageLoopHook(_messageLoopForm.Handle));
-
-                        _logger?.LogInformation($"TWAIN session opened. State: {_session.State}");
-                        _initialized = true;
+                        _logger?.LogWarning($"TWAIN session state is {_session.State}, expected >= 3 (DSM loaded)");
                     }
-                    catch (Exception ex)
+
+                    // Try to enumerate sources immediately to verify
+                    var sourceCount = 0;
+                    foreach (var source in _session.GetSources())
                     {
-                        _logger?.LogError($"TWAIN initialization error: {ex}");
-                        _initException = ex;
+                        sourceCount++;
+                        _logger?.LogInformation($"Found TWAIN source: {source.Name}");
                     }
-                    finally
-                    {
-                        _initCompleteEvent.Set();
-                    }
-                };
+                    _logger?.LogInformation($"Total TWAIN sources found during init: {sourceCount}");
 
-                // Start processing work items
-                _messageLoopForm.Shown += (s, e) =>
+                    _initialized = true;
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogError($"TWAIN initialization error: {ex}");
+                    _initException = ex;
+                }
+                finally
+                {
+                    _initCompleteEvent.Set();
+                }
+
+                // Only run message loop if initialization succeeded
+                if (_initialized)
                 {
                     // Start a timer to process work queue
-                    var timer = new System.Windows.Forms.Timer { Interval = 10 };
+                    var timer = new System.Windows.Forms.Timer { Interval = 50 };
                     timer.Tick += (ts, te) => ProcessWorkQueue();
                     timer.Start();
-                };
 
-                // Run the message loop - this blocks until the form is closed
-                Application.Run(_messageLoopForm);
+                    _logger?.LogInformation("Starting message loop...");
+                    // Run the message loop - this blocks until the form is closed
+                    Application.Run(_messageLoopForm);
+                    _logger?.LogInformation("Message loop ended");
+                }
             }
             catch (Exception ex)
             {
